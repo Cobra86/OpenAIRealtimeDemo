@@ -2,6 +2,9 @@
 using Microsoft.SemanticKernel;
 using NAudio.Wave;
 using OpenAI.RealtimeConversation;
+using System.ClientModel;
+using Azure.AI.OpenAI;
+using System.Text; // Required for Azure OpenAI
 
 namespace OpenAIRealtimeDemo
 {
@@ -25,30 +28,68 @@ namespace OpenAIRealtimeDemo
         static DateTime lastAudioOutput = DateTime.MinValue;
         static readonly TimeSpan audioBufferTime = TimeSpan.FromMilliseconds(500); // Buffer time after audio
 
+        // Speaker output for handling audio playback
+        static SpeakerOutput? speakerOutput = null;
+
         public static async Task Main(string[] args)
         {
+            // Load configuration
             var config = new ConfigurationBuilder()
-                .AddUserSecrets<Program>()
+                .AddUserSecrets<Program>()                
                 .Build();
 
-            string? apiKey = config["OpenAIKey"];
-
-            if (string.IsNullOrWhiteSpace(apiKey))
+            // Determine which API to use (OpenAI or Azure OpenAI)
+            bool useAzure = false;
+            string? useAzureStr = config["UseAzure"];
+            if (!string.IsNullOrWhiteSpace(useAzureStr) && bool.TryParse(useAzureStr, out bool result))
             {
-                Console.WriteLine("API key not found. Please set OpenAI:ApiKey in configuration or environment variable.");
-                return;
+                useAzure = result;
+            }
+
+            Console.WriteLine($"Using API: {(useAzure ? "Azure OpenAI" : "OpenAI")}");
+
+            // Initialize the appropriate client
+            RealtimeConversationClient realtimeClient;
+
+            if (useAzure)
+            {
+                string? endpoint = config["AzureOpenAI:Endpoint"];
+                string? apiKey = config["AzureOpenAI:ApiKey"];
+                string? deploymentName = config["AzureOpenAI:DeploymentName"];
+
+                if (string.IsNullOrWhiteSpace(endpoint) || string.IsNullOrWhiteSpace(apiKey) || string.IsNullOrWhiteSpace(deploymentName))
+                {
+                    Console.WriteLine("Azure OpenAI configuration is incomplete. Please set AzureOpenAI:Endpoint, AzureOpenAI:ApiKey, and AzureOpenAI:DeploymentName in configuration.");
+                    return;
+                }
+
+                // Initialize Azure OpenAI client
+                realtimeClient = Helpers.GetAzureRealtimeConversationClient(endpoint, apiKey, deploymentName);
+                Console.WriteLine($"Connected to Azure OpenAI endpoint: {endpoint}");
+                Console.WriteLine($"Using deployment: {deploymentName}");
+            }
+            else
+            {
+                string? apiKey = config["OpenAIKey"];
+
+                if (string.IsNullOrWhiteSpace(apiKey))
+                {
+                    Console.WriteLine("OpenAI API key not found. Please set OpenAIKey in configuration or environment variable.");
+                    return;
+                }
+
+                // Initialize OpenAI client
+                realtimeClient = Helpers.GetRealtimeConversationClient(apiKey);
+                Console.WriteLine("Connected to OpenAI API");
             }
 
             // Build kernel with plugins
             var kernel = Kernel.CreateBuilder().Build();
             kernel.ImportPluginFromType<WeatherPlugin>();
 
-            // Initialize Realtime Conversation client
-            var realtimeClient = Helpers.GetRealtimeConversationClient(apiKey);
-
             /* Select microphone device */
             int deviceCount = WaveInEvent.DeviceCount;
-            Console.WriteLine("Available microphones:");
+            Console.WriteLine("\nAvailable microphones:");
             for (int i = 0; i < deviceCount; i++)
                 Console.WriteLine($"{i}: {WaveInEvent.GetCapabilities(i).ProductName}");
 
@@ -72,6 +113,9 @@ namespace OpenAIRealtimeDemo
 
             try
             {
+                // Initialize speaker output
+                speakerOutput = new SpeakerOutput();
+
                 // Start a new conversation session - Create session outside using to manage lifecycle better
                 RealtimeConversationSession session = await realtimeClient.StartConversationSessionAsync();
 
@@ -156,6 +200,9 @@ namespace OpenAIRealtimeDemo
 
                                 // If we're here, it might be a human interruption - log it
                                 Console.WriteLine("Possible human interruption detected");
+
+                                // Clear speaker output to prevent feedback when the user is speaking
+                                speakerOutput?.ClearPlayback();
                             }
                             // General time-based prevention (additional safety)
                             else if (DateTime.Now - lastAudioOutput < audioBufferTime)
@@ -189,9 +236,9 @@ namespace OpenAIRealtimeDemo
                     Console.WriteLine("Starting recording...");
                     microphoneInstance.StartRecording();
 
-                    // Start the message receiver task
+                    // Start the message receiver task for processing server updates
                     var cts = new CancellationTokenSource();
-                    _ = Task.Run(() => new AudioProcessor().ProcessSessionUpdatesAsync(session, kernel, cts.Token, () => sessionActive = false));
+                    _ = Task.Run(() => ProcessSessionUpdatesAsync(session, kernel, cts.Token, () => sessionActive = false));
 
                     // Command loop
                     Console.WriteLine("\n=== COMMANDS ===");
@@ -268,7 +315,7 @@ namespace OpenAIRealtimeDemo
                 }
                 finally
                 {
-                    // Ensure the session is always properly disposed
+                    // Ensure resources are always properly disposed
                     if (microphoneInstance != null)
                     {
                         try
@@ -283,12 +330,268 @@ namespace OpenAIRealtimeDemo
                         microphoneInstance = null;
                     }
 
+                    speakerOutput?.Dispose();
+                    speakerOutput = null;
+
                     session.Dispose();
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"Error: {ex.Message}");
+            }
+        }
+
+        // Helper method to process session updates
+        private static async Task ProcessSessionUpdatesAsync(RealtimeConversationSession session, Kernel kernel,
+                                              CancellationToken ct, Action onSessionClosed = null)
+        {
+            string textResponse = "";
+            bool isFirstAudioInResponse = true;
+            Dictionary<string, StringBuilder> functionArgumentBuildersById = [];
+
+            try
+            {
+                await foreach (ConversationUpdate update in session.ReceiveUpdatesAsync(ct))
+                {
+                    // Handle different update types
+                    if (update is ConversationSessionStartedUpdate sessionStartedUpdate)
+                    {
+                        Console.WriteLine($"<<< Session started. ID: {sessionStartedUpdate.SessionId}");
+                    }
+                    else if (update is ConversationInputSpeechStartedUpdate)
+                    {
+                        Console.WriteLine("  -- Voice activity detection started");
+
+                        // Clear any playing audio when user starts speaking to prevent feedback
+                        speakerOutput?.ClearPlayback();
+                    }
+                    else if (update is ConversationInputSpeechFinishedUpdate)
+                    {
+                        Console.WriteLine("  -- Voice activity detection ended");
+                    }
+                    else if (update is ConversationItemStreamingStartedUpdate itemStreamingStartedUpdate)
+                    {
+                        isFirstAudioInResponse = true;
+                        textResponse = "";
+
+                        Console.WriteLine("  -- Begin streaming of new item");
+                        if (!string.IsNullOrEmpty(itemStreamingStartedUpdate.FunctionName))
+                        {
+                            Console.WriteLine($"    {itemStreamingStartedUpdate.FunctionName}: ");
+                        }
+                    }
+                    else if (update is ConversationItemStreamingPartDeltaUpdate deltaUpdate)
+                    {
+                        // Handle transcription or text
+                        if (!string.IsNullOrEmpty(deltaUpdate.AudioTranscript))
+                        {
+                            Console.Write(deltaUpdate.AudioTranscript);
+                        }
+
+                        if (!string.IsNullOrEmpty(deltaUpdate.Text))
+                        {
+                            Console.Write(deltaUpdate.Text);
+                            textResponse += deltaUpdate.Text;
+                        }
+
+                        // Handle function arguments
+                        if (!string.IsNullOrEmpty(deltaUpdate.FunctionArguments))
+                        {
+                            Console.Write(deltaUpdate.FunctionArguments);
+
+                            if (!functionArgumentBuildersById.TryGetValue(deltaUpdate.ItemId, out StringBuilder? arguments))
+                            {
+                                functionArgumentBuildersById[deltaUpdate.ItemId] = arguments = new();
+                            }
+
+                            arguments.Append(deltaUpdate.FunctionArguments);
+                        }
+
+                        // Handle audio
+                        if (deltaUpdate.AudioBytes is not null)
+                        {
+                            // On first audio chunk, pause microphone to prevent echo
+                            if (isFirstAudioInResponse)
+                            {
+                                isPlayingAudio = true;
+                                isFirstAudioInResponse = false;
+
+                                // Stop the microphone while AI is talking - only in manual mode
+                                if (manualModeActive)
+                                {
+                                    microphoneMuted = true;
+                                    if (microphoneInstance != null)
+                                    {
+                                        microphoneInstance.StopRecording();
+                                    }
+                                    Console.WriteLine("Microphone paused while AI is speaking (manual mode)");
+                                }
+                                else
+                                {
+                                    Console.WriteLine("Microphone remains active for interruptions (auto mode)");
+                                }
+                            }
+
+                            // Update lastAudioOutput time
+                            lastAudioOutput = DateTime.Now;
+
+                            // Store AI audio sample for fingerprinting
+                            AudioProcessor.StoreAIAudioSample(deltaUpdate.AudioBytes.ToArray());
+
+                            // If using SpeakerOutput, play audio through it
+                            speakerOutput?.EnqueueForPlayback(deltaUpdate.AudioBytes.ToArray());
+                        }
+                    }
+                    else if (update is ConversationItemStreamingFinishedUpdate itemStreamingFinishedUpdate)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine($"  -- Item streaming finished, item_id={itemStreamingFinishedUpdate.ItemId}");
+
+                        // If the item was a function call, invoke the function
+                        if (itemStreamingFinishedUpdate.FunctionCallId is not null)
+                        {
+                            Console.WriteLine($"    + Responding to tool invoked by item: {itemStreamingFinishedUpdate.FunctionName}");
+
+                            // Parse function name
+                            var (functionName, pluginName) = Helpers.ParseFunctionName(itemStreamingFinishedUpdate.FunctionName);
+
+                            // Deserialize arguments
+                            var argumentsString = functionArgumentBuildersById[itemStreamingFinishedUpdate.ItemId].ToString();
+                            var arguments = Helpers.DeserializeArguments(argumentsString);
+
+                            // Create function call content
+                            var functionCallContent = new FunctionCallContent(
+                                functionName: functionName,
+                                pluginName: pluginName,
+                                id: itemStreamingFinishedUpdate.FunctionCallId,
+                                arguments: arguments);
+
+                            try
+                            {
+                                // Invoke the function
+                                var resultContent = await functionCallContent.InvokeAsync(kernel);
+
+                                // Create function call output and send it back
+                                ConversationItem functionOutputItem = ConversationItem.CreateFunctionCallOutput(
+                                    callId: itemStreamingFinishedUpdate.FunctionCallId,
+                                    output: Helpers.ProcessFunctionResult(resultContent.Result));
+
+                                await session.AddItemAsync(functionOutputItem);
+                            }
+                            catch (ObjectDisposedException)
+                            {
+                                Console.WriteLine("Session connection closed while processing tool response.");
+                                onSessionClosed?.Invoke();
+                                return;
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Error invoking function: {ex.Message}");
+                            }
+                        }
+                        // If the item was a message, display it
+                        else if (itemStreamingFinishedUpdate.MessageContentParts?.Count > 0)
+                        {
+                            Console.WriteLine($"    + [{itemStreamingFinishedUpdate.MessageRole}]: ");
+
+                            foreach (ConversationContentPart contentPart in itemStreamingFinishedUpdate.MessageContentParts)
+                            {
+                                Console.Write(contentPart.AudioTranscript);
+                            }
+
+                            Console.WriteLine();
+                        }
+                    }
+                    else if (update is ConversationInputTranscriptionFinishedUpdate transcriptionUpdate)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine($"  -- User audio transcript: {transcriptionUpdate.Transcript}");
+                        Console.WriteLine();
+                    }
+                    else if (update is ConversationResponseFinishedUpdate turnFinishedUpdate)
+                    {
+                        Console.WriteLine($"  -- Model turn generation finished. Status: {turnFinishedUpdate.Status}");
+
+                        try
+                        {
+                            isPlayingAudio = false;
+                            lastAudioOutput = DateTime.Now;
+
+                            // Wait for a short period to avoid feedback loop
+                            await Task.Delay(audioBufferTime, ct);
+
+                            // Check if function call results need to be processed
+                            if (turnFinishedUpdate.CreatedItems.Any(item => item.FunctionName?.Length > 0))
+                            {
+                                Console.WriteLine("  -- Ending client turn for pending tool responses");
+                                await session.StartResponseAsync();
+                            }
+                            else
+                            {
+                                // Resume microphone if it was muted
+                                if (manualModeActive && microphoneMuted)
+                                {
+                                    microphoneMuted = false;
+                                    microphoneInstance?.StartRecording();
+                                    Console.WriteLine("Microphone resumed");
+                                }
+
+                                if (!string.IsNullOrEmpty(textResponse))
+                                {
+                                    Console.WriteLine("\n=== Complete Text Response ===");
+                                    Console.WriteLine(textResponse);
+                                    Console.WriteLine("==============================");
+                                }
+
+                                Console.WriteLine("\n--- AI RESPONSE COMPLETED ---");
+
+                                // For auto mode, print a prompt to let the user know they can speak
+                                if (!manualModeActive)
+                                {
+                                    Console.WriteLine(">>> You can speak now...");
+                                }
+                            }
+                        }
+                        catch (ObjectDisposedException)
+                        {
+                            Console.WriteLine("Session connection closed while processing response.");
+                            onSessionClosed?.Invoke();
+                            return;
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"Error after response: {ex.Message}");
+                        }
+                    }
+                    else if (update is ConversationErrorUpdate errorUpdate)
+                    {
+                        Console.WriteLine();
+                        Console.WriteLine($"ERROR: {errorUpdate.Message}");
+
+                        // Resume microphone if needed
+                        if (microphoneMuted && microphoneInstance != null)
+                        {
+                            microphoneMuted = false;
+                            microphoneInstance.StartRecording();
+                            Console.WriteLine("Microphone resumed after error");
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Expected when cancellation is requested
+                Console.WriteLine("Operation was canceled.");
+            }
+            catch (ObjectDisposedException ex)
+            {
+                Console.WriteLine($"Session was disposed: {ex.Message}");
+                onSessionClosed?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error in processing updates: {ex.Message}");
             }
         }
     }

@@ -10,12 +10,23 @@ namespace OpenAIRealtimeDemo
 #pragma warning disable OPENAI002 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
     public class Helpers
     {
-        /// <summary>Helper method to get a RealtimeConversationClient.</summary>
+        /// <summary>Helper method to get a RealtimeConversationClient for OpenAI.</summary>
         public static RealtimeConversationClient GetRealtimeConversationClient(string apiKey)
         {
             return new RealtimeConversationClient(
                 model: "gpt-4o-realtime-preview",
                 credential: new ApiKeyCredential(apiKey));
+        }
+
+        /// <summary>Helper method to get a RealtimeConversationClient for Azure OpenAI.</summary>
+        public static RealtimeConversationClient GetAzureRealtimeConversationClient(string endpoint, string apiKey, string deploymentName)
+        {
+            // Use the AzureOpenAIClient to create a RealtimeConversationClient
+            var aoaiClient = new Azure.AI.OpenAI.AzureOpenAIClient(
+                new Uri(endpoint),
+                new ApiKeyCredential(apiKey));
+
+            return aoaiClient.GetRealtimeConversationClient(deploymentName);
         }
 
         /// <summary>Helper method to parse a function name for compatibility with Semantic Kernel plugins/functions.</summary>
